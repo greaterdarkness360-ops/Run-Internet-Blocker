@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.natanael.run.service.RunVpnService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +18,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<RunUiState> = _uiState.asStateFlow()
 
     init {
+        val isMasterActive = RunVpnService.isMasterVpnEnabled(application)
+        _uiState.update { it.copy(isMasterVpnActive = isMasterActive) }
         loadInstalledApps()
     }
 
@@ -26,6 +29,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 if (event.enabled) {
                     _uiState.update { it.copy(showVpnPermissionDialog = true) }
                 } else {
+                    RunVpnService.stop(getApplication())
                     _uiState.update {
                         it.copy(
                             isMasterVpnActive = false,
@@ -43,6 +47,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             }
             is RunUiEvent.OnVpnPermissionResult -> {
                 if (event.granted) {
+                    RunVpnService.startOrReload(getApplication())
                     _uiState.update {
                         it.copy(
                             isMasterVpnActive = true,
@@ -51,6 +56,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 } else {
+                    RunVpnService.saveMasterVpnState(getApplication(), false)
                     _uiState.update {
                         it.copy(
                             isMasterVpnActive = false,
@@ -73,14 +79,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is RunUiEvent.ToggleWifiBlock -> {
-                updateAppBlockState(event.packageName) { app ->
-                    app.copy(isWifiBlocked = event.blocked)
-                }
+                updateAppBlockState(event.packageName, isWifi = true, blocked = event.blocked)
             }
             is RunUiEvent.ToggleCellularBlock -> {
-                updateAppBlockState(event.packageName) { app ->
-                    app.copy(isCellularBlocked = event.blocked)
-                }
+                updateAppBlockState(event.packageName, isWifi = false, blocked = event.blocked)
             }
             is RunUiEvent.DismissPermissionWarning -> {
                 _uiState.update { it.copy(permissionDeniedMessage = null) }
@@ -91,7 +93,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     fun loadInstalledApps() {
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isLoading = true) }
-            val pm = getApplication<Application>().packageManager
+            val context = getApplication<Application>()
+            val pm = context.packageManager
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
@@ -101,9 +104,12 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 emptyList()
             }
 
+            val wifiBlockedSet = RunVpnService.getWifiBlockedPackages(context)
+            val cellularBlockedSet = RunVpnService.getCellularBlockedPackages(context)
+
             val appList = resolveInfos.mapNotNull { resolveInfo ->
                 val packageName = resolveInfo.activityInfo.packageName
-                if (packageName == getApplication<Application>().packageName) return@mapNotNull null
+                if (packageName == context.packageName) return@mapNotNull null
                 val appName = resolveInfo.loadLabel(pm).toString()
                 val icon = try {
                     resolveInfo.loadIcon(pm)
@@ -114,8 +120,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     packageName = packageName,
                     appName = appName,
                     icon = icon,
-                    isWifiBlocked = false,
-                    isCellularBlocked = false
+                    isWifiBlocked = wifiBlockedSet.contains(packageName),
+                    isCellularBlocked = cellularBlockedSet.contains(packageName)
                 )
             }.distinctBy { it.packageName }.sortedBy { it.appName.lowercase() }
 
@@ -129,10 +135,19 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun updateAppBlockState(packageName: String, transform: (AppItem) -> AppItem) {
+    private fun updateAppBlockState(packageName: String, isWifi: Boolean, blocked: Boolean) {
         _uiState.update { currentState ->
             val updatedAll = currentState.allApps.map { app ->
-                if (app.packageName == packageName) transform(app) else app
+                if (app.packageName == packageName) {
+                    val updatedApp = if (isWifi) app.copy(isWifiBlocked = blocked) else app.copy(isCellularBlocked = blocked)
+                    RunVpnService.saveRuleChange(
+                        getApplication(),
+                        packageName = packageName,
+                        isWifiBlocked = updatedApp.isWifiBlocked,
+                        isCellularBlocked = updatedApp.isCellularBlocked
+                    )
+                    updatedApp
+                } else app
             }
             currentState.copy(
                 allApps = updatedAll,
